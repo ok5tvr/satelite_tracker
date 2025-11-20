@@ -18,8 +18,8 @@
 #include "logo.h"
 
 // ====================== WIFI ======================
-const char* WIFI_SSID = "Vlas_dolni_vlkys";
-const char* WIFI_PASS = "tomasV860309";
+const char* WIFI_SSID = "xxx";
+const char* WIFI_PASS = "xxxgit";
 
 // ====================== NTP & TIMEZONE ======================
 const char* NTP_SERVER = "pool.ntp.org";
