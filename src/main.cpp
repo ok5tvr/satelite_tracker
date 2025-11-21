@@ -1,4 +1,13 @@
 // MULTI-SAT TRACKER – ESP32 + ST7789 (320x240) + TFT_eSPI + Smooth Fonts
+// Features:
+//  - multi-satellite tracking (SGP4)
+//  - TLE cache in SPIFFS
+//  - WiFi STA, fallback AP (SAT_TRACKER / sat123456)
+//  - Web config (QTH, satellites, Doppler, GPS, TZ, GPS-only offline mode, WiFi SSID/PASS)
+//  - GPS (TinyGPSPlus): QTH + time, offline mode
+//  - Configurable timezone (POSIX TZ strings via <select>)
+//  - RX/TX frequencies for satellites + Doppler shift
+//  - Cached pass track on radar
 
 #define SMOOTH_FONT
 #define LOAD_GFXFF
@@ -15,29 +24,57 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
+#include <TinyGPSPlus.h>
 #include "logo.h"
 
 // ====================== WIFI ======================
-const char* WIFI_SSID = "xxx";
-const char* WIFI_PASS = "xxxgit";
+// Default WiFi credentials (fallback if not set in config)
+const char* WIFI_SSID = "Vxxxx";
+const char* WIFI_PASS = "xxxx";
 
-// ====================== NTP & TIMEZONE ======================
-const char* NTP_SERVER = "pool.ntp.org";
+// Configurable WiFi values (loaded from config / web)
+char g_wifiSsid[33] = "";   // max 32 chars + '\0'
+char g_wifiPass[65] = "";   // max 64 chars + '\0'
+
+// ====================== TIMEZONE DEFAULT ======================
 const char* TZ_EU_PRAGUE = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
 // ====================== QTH ======================
 double g_qthLat = 49.7501;
 double g_qthLon = 13.3800;
 double g_qthAlt = 310.0;
-float g_minElDeg = 10.0;
+float  g_minElDeg = 10.0f;
+
+// ====================== DOPPLER ======================
+bool   g_dopplerEnabled = false;
+
+// ====================== TIME / TZ FLAGS ======================
+bool   g_haveTime = false;       // Do we have valid time (NTP or GPS)?
+char  g_tz[64] = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+
+// ====================== GPS ======================
+TinyGPSPlus gps;
+HardwareSerial SerialGPS(1);
+
+bool     g_gpsEnabled   = false;
+bool     g_gpsOnlyMode  = false;  // "GPS only offline" – do not start STA WiFi / NTP
+int      g_gpsRxPin     = 16;     // default RX
+int      g_gpsTxPin     = 17;     // default TX
+uint32_t g_gpsBaud      = 9600;   // default baud
+
+bool     g_gpsHasFix    = false;
+bool     g_gpsTimeSet   = false;
+
+// Flag to avoid repeated pass recomputation based on GPS
+bool     g_passesInitByGps = false;
 
 // ====================== TFT & BACKLIGHT ======================
-TFT_eSPI tft = TFT_eSPI();  // piny v User_Setup
+TFT_eSPI tft = TFT_eSPI();  // pins in User_Setup
 
 #define TFT_BL 4
 #define DARKGREY 0x7BEF
 
-// Barva pozadí pro boot screen (#63A6C9 → BGR = 0x6539)
+// Background color for boot screen (#63A6C9 → BGR = 0x6539)
 uint16_t boot_bg_color = tft.color565(201, 166, 99);
 #define BOOT_BG boot_bg_color
 
@@ -46,20 +83,26 @@ const int RADAR_CY = 120;
 const int RADAR_R  = 60;
 
 String g_ipStr;
+bool   g_isAPMode = false;
 
 // ====================== WEB SERVER ======================
 WebServer server(80);
 
-// ====================== SATELITY ======================
+// ====================== SATELLITES ======================
 struct SatConfig {
   const char* id;
   const char* shortName;
   const char* defaultName;
   const char* tleUrl;
-  char name[32];
-  char l1[80];
-  char l2[80];
-  bool enabled;
+
+  char  name[32];
+  char  l1[80];
+  char  l2[80];
+
+  float rxFreqMHz;   // 0 = not defined
+  float txFreqMHz;
+
+  bool  enabled;
 };
 
 SatConfig g_sats[] = {
@@ -68,28 +111,40 @@ SatConfig g_sats[] = {
     "ISS",
     "ISS (ZARYA)",
     "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=tle",
-    "", "", "", true
+    "", "", "",
+    145.800f,   // RX example
+    437.800f,   // TX example
+    true
   },
   {
     "SO50",
     "SO50",
     "SO-50",
     "https://celestrak.org/NORAD/elements/gp.php?NAME=SO-50&FORMAT=tle",
-    "", "", "", false
+    "", "", "",
+    436.795f,
+    145.850f,
+    false
   },
   {
     "FO29",
     "FO29",
     "FO-29",
     "https://celestrak.org/NORAD/elements/gp.php?NAME=FO-29&FORMAT=tle",
-    "", "", "", false
+    "", "", "",
+    435.850f,
+    145.900f,
+    false
   },
   {
     "AO91",
     "AO91",
     "AO-91",
     "https://celestrak.org/NORAD/elements/gp.php?NAME=AO-91&FORMAT=tle",
-    "", "", "", false
+    "", "", "",
+    145.960f,
+    435.250f,
+    false
   }
 };
 
@@ -131,6 +186,10 @@ const int TRAIL_LEN = 120;
 TrailPoint g_trail[TRAIL_LEN];
 int g_trailCount   = 0;
 int g_trailPassIdx = -1;
+
+// For Doppler – remember previous ranges
+float g_prevDistKm[SAT_COUNT];
+bool  g_prevDistValid[SAT_COUNT];
 
 // ====================== DISPLAY MODE ======================
 enum DisplayMode {
@@ -174,12 +233,9 @@ String getFSInfoString() {
   return String(buf);
 }
 
-// ===== TLE CACHE VE FS =====
-
-// Max stáří TLE v sekundách (24h)
+// ===== TLE CACHE IN FS =====
 const time_t TLE_MAX_AGE = 24 * 3600;
 
-// Vygeneruje cestu k TLE souboru pro daný satelit
 String tlePathForSat(const SatConfig &sc) {
   String path = "/tle_";
   path += sc.id;
@@ -187,7 +243,6 @@ String tlePathForSat(const SatConfig &sc) {
   return path;
 }
 
-// Uložení TLE do FS: 1. řádek = Unix timestamp, 2.=name, 3.=L1, 4.=L2
 bool saveTleToFs(const SatConfig &sc, time_t nowUtc) {
   String path = tlePathForSat(sc);
   File f = SPIFFS.open(path, FILE_WRITE);
@@ -206,7 +261,6 @@ bool saveTleToFs(const SatConfig &sc, time_t nowUtc) {
   return true;
 }
 
-// Načtení TLE z FS, jen pokud není starší než 24h
 bool loadTleFromFs(SatConfig &sc, time_t nowUtc) {
   String path = tlePathForSat(sc);
   File f = SPIFFS.open(path, FILE_READ);
@@ -217,7 +271,6 @@ bool loadTleFromFs(SatConfig &sc, time_t nowUtc) {
 
   String line;
 
-  // 1) timestamp
   line = f.readStringUntil('\n');
   line.trim();
   if (line.length() == 0) {
@@ -233,7 +286,6 @@ bool loadTleFromFs(SatConfig &sc, time_t nowUtc) {
     return false;
   }
 
-  // zkontroluj stáří, a i případný nesmysl (čas v budoucnosti)
   if (nowUtc < ts || (nowUtc - ts) > TLE_MAX_AGE) {
     Serial.printf("TLE FS: too old or future (%s) now=%ld ts=%ld\n",
                   path.c_str(), (long)nowUtc, (long)ts);
@@ -241,15 +293,12 @@ bool loadTleFromFs(SatConfig &sc, time_t nowUtc) {
     return false;
   }
 
-  // 2) name
   String name = f.readStringUntil('\n');
   name.trim();
 
-  // 3) L1
   String l1 = f.readStringUntil('\n');
   l1.trim();
 
-  // 4) L2
   String l2 = f.readStringUntil('\n');
   l2.trim();
 
@@ -269,10 +318,16 @@ bool loadTleFromFs(SatConfig &sc, time_t nowUtc) {
 }
 
 // ===== CONFIG LOAD / SAVE =====
+// Format:
+// line1: lat lon alt minEl doppler gpsEnabled gpsOnly gpsRx gpsTx gpsBaud
+// line2: IDs of enabled satellites (space separated)
+// line3: TZ string (POSIX)
+// line4: wifiSsid|wifiPass
 void loadConfig() {
   File f = SPIFFS.open(PATH_CONFIG, FILE_READ);
   if (!f) {
     Serial.println("Config not found, using defaults.");
+    strncpy(g_tz, TZ_EU_PRAGUE, sizeof(g_tz));
     return;
   }
 
@@ -283,16 +338,40 @@ void loadConfig() {
   if (line1.length() > 0) {
     double lat, lon, alt;
     float minEl;
-    int n = sscanf(line1.c_str(), "%lf %lf %lf %f", &lat, &lon, &alt, &minEl);
+    int doppler = 0, gpsEn = 0, gpsOnly = 0;
+    int rx = g_gpsRxPin, tx = g_gpsTxPin;
+    long baud = g_gpsBaud;
+
+    int n = sscanf(
+      line1.c_str(),
+      "%lf %lf %lf %f %d %d %d %d %d %ld",
+      &lat, &lon, &alt, &minEl,
+      &doppler, &gpsEn, &gpsOnly,
+      &rx, &tx, &baud
+    );
+
     if (n >= 3) {
       g_qthLat = lat;
       g_qthLon = lon;
       g_qthAlt = alt;
-      if (n == 4) {
-        g_minElDeg = minEl;
+      if (n >= 4) g_minElDeg      = minEl;
+      if (n >= 5) g_dopplerEnabled = (doppler != 0);
+      if (n >= 6) g_gpsEnabled     = (gpsEn   != 0);
+      if (n >= 7) g_gpsOnlyMode    = (gpsOnly != 0);
+      if (n >= 9) {
+        g_gpsRxPin = rx;
+        g_gpsTxPin = tx;
       }
-      Serial.printf("QTH from config: %.4f %.4f %.1f  minEl=%.1f\n",
-                    g_qthLat, g_qthLon, g_qthAlt, g_minElDeg);
+      if (n >= 10) {
+        g_gpsBaud = (baud > 0) ? (uint32_t)baud : 9600;
+      }
+
+      Serial.printf(
+        "QTH from config: %.4f %.4f %.1f  minEl=%.1f doppler=%d gpsEn=%d gpsOnly=%d RX=%d TX=%d baud=%lu\n",
+        g_qthLat, g_qthLon, g_qthAlt, g_minElDeg,
+        g_dopplerEnabled, g_gpsEnabled, g_gpsOnlyMode,
+        g_gpsRxPin, g_gpsTxPin, (unsigned long)g_gpsBaud
+      );
     }
   }
 
@@ -320,8 +399,34 @@ void loadConfig() {
     start = sp + 1;
   }
 
+  // third line: TZ
+  String line3 = f.readStringUntil('\n');
+  line3.trim();
+  if (line3.length() > 0) {
+    line3.toCharArray(g_tz, sizeof(g_tz));
+  } else {
+    strncpy(g_tz, TZ_EU_PRAGUE, sizeof(g_tz));
+  }
+
+  // fourth line: WiFi SSID|PASS (optional for older configs)
+  String line4 = f.readStringUntil('\n');
+  line4.trim();
+  if (line4.length() > 0) {
+    int sep = line4.indexOf('|');
+    if (sep >= 0) {
+      String ssid = line4.substring(0, sep);
+      String pass = line4.substring(sep + 1);
+      ssid.toCharArray(g_wifiSsid, sizeof(g_wifiSsid));
+      pass.toCharArray(g_wifiPass, sizeof(g_wifiPass));
+    } else {
+      // If no '|', treat whole line as SSID, password empty
+      line4.toCharArray(g_wifiSsid, sizeof(g_wifiSsid));
+      g_wifiPass[0] = '\0';
+    }
+  }
+
   f.close();
-  Serial.println("Config loaded.");
+  Serial.printf("Config loaded. TZ=%s\n", g_tz);
 }
 
 void saveConfig() {
@@ -331,7 +436,14 @@ void saveConfig() {
     return;
   }
 
-  f.printf("%.6f %.6f %.3f %.1f\n", g_qthLat, g_qthLon, g_qthAlt, g_minElDeg);
+  f.printf(
+    "%.6f %.6f %.3f %.1f %d %d %d %d %d %lu\n",
+    g_qthLat, g_qthLon, g_qthAlt, g_minElDeg,
+    g_dopplerEnabled ? 1 : 0,
+    g_gpsEnabled ? 1 : 0,
+    g_gpsOnlyMode ? 1 : 0,
+    g_gpsRxPin, g_gpsTxPin, (unsigned long)g_gpsBaud
+  );
 
   for (int i = 0; i < SAT_COUNT; i++) {
     if (g_sats[i].enabled) {
@@ -341,30 +453,80 @@ void saveConfig() {
   }
   f.print("\n");
 
+  // line 3: TZ
+  f.println(g_tz);
+
+  // line 4: WiFi SSID|PASS
+  f.print(g_wifiSsid);
+  f.print("|");
+  f.println(g_wifiPass);
+
   f.close();
   Serial.println("Config saved.");
 }
 
-// ====================== WIFI ======================
-void connectWiFi() {
+// ====================== WIFI / AP ======================
+bool connectWiFiStation() {
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(g_wifiSsid, g_wifiPass);
 
-  Serial.print("WiFi...");
-  while (WiFi.status() != WL_CONNECTED) {
+  Serial.printf("WiFi STA... SSID='%s'\n", g_wifiSsid);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < 15000) {
     delay(300);
     Serial.print(".");
   }
-  Serial.println(" OK");
 
-  g_ipStr = WiFi.localIP().toString();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" OK");
+    g_ipStr = WiFi.localIP().toString();
+    return true;
+  } else {
+    Serial.println(" FAIL");
+    return false;
+  }
+}
+
+void startApMode() {
+  Serial.println("[WiFi] Starting AP mode...");
+
+  // Disable STA, clean start
+  WiFi.disconnect(true, true);
+  delay(100);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+
+  // Static IP for AP – classic 192.168.4.1
+  IPAddress local_ip(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(local_ip, gateway, subnet)) {
+    Serial.println("[WiFi] softAPConfig FAILED");
+  }
+
+  // channel 1, visible SSID, max 4 clients
+  bool ok = WiFi.softAP("SAT_TRACKER", "sat123456", 1, 0, 4);
+  if (!ok) {
+    Serial.println("[WiFi] softAP FAILED!");
+  } else {
+    Serial.println("[WiFi] softAP OK");
+  }
+
+  IPAddress ip = WiFi.softAPIP();
+  g_ipStr = ip.toString();
+  g_isAPMode = true;
+
+  Serial.printf("[WiFi] AP MODE: SSID=SAT_TRACKER PASS=sat123456 IP=%s\n",
+                g_ipStr.c_str());
 }
 
 // ====================== NTP (UTC + TZ) ======================
-void setupTime() {
-  configTime(0, 0, NTP_SERVER);
-  setenv("TZ", TZ_EU_PRAGUE, 1);
+void setupTimeNTP() {
+  setenv("TZ", g_tz, 1);
   tzset();
+
+  configTime(0, 0, "pool.ntp.org");
 
   Serial.print("NTP sync");
   time_t now = 0;
@@ -378,6 +540,7 @@ void setupTime() {
 
     if (now > 1672531200 && okLocal) { // > 2023-01-01
       Serial.println(" OK");
+      g_haveTime = true;
       break;
     }
 
@@ -385,27 +548,58 @@ void setupTime() {
     delay(500);
 
     if (millis() - startMs > TIMEOUT_MS) {
-      Serial.println(" TIMEOUT, pokracuju s aktualnim casem (může být nepřesný)");
+      Serial.println(" TIMEOUT, continuing with current time (may be inaccurate)");
       break;
     }
   }
 
-  tm tu;
-  gmtime_r(&now, &tu);
-  Serial.printf("UTC   : %02d:%02d:%02d\n", tu.tm_hour, tu.tm_min, tu.tm_sec);
-  Serial.printf("Local : %02d:%02d:%02d\n", localInfo.tm_hour, localInfo.tm_min, localInfo.tm_sec);
+  if (g_haveTime) {
+    tm tu;
+    gmtime_r(&now, &tu);
+    Serial.printf("UTC   : %02d:%02d:%02d\n", tu.tm_hour, tu.tm_min, tu.tm_sec);
+    Serial.printf("Local : %02d:%02d:%02d\n", localInfo.tm_hour, localInfo.tm_min, localInfo.tm_sec);
+  }
 }
 
-// ====================== BMP HELPERS (splash logo) ======================
+// ====================== GPS TIME SET ======================
+void setSystemTimeFromGps() {
+  if (!gps.time.isValid() || !gps.date.isValid()) return;
 
+  // Temporarily switch TZ to UTC so mktime gives UTC
+  char oldTz[64];
+  strncpy(oldTz, g_tz, sizeof(oldTz));
+  setenv("TZ", "UTC0", 1);
+  tzset();
 
+  struct tm t {};
+  t.tm_year = gps.date.year() - 1900;
+  t.tm_mon  = gps.date.month() - 1;
+  t.tm_mday = gps.date.day();
+  t.tm_hour = gps.time.hour();
+  t.tm_min  = gps.time.minute();
+  t.tm_sec  = gps.time.second();
+
+  time_t utc = mktime(&t);
+
+  struct timeval tv;
+  tv.tv_sec = utc;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+
+  // Restore TZ
+  setenv("TZ", oldTz, 1);
+  tzset();
+
+  g_haveTime = true;
+  g_gpsTimeSet = true;
+
+  Serial.printf("Time set from GPS: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+                gps.date.year(), gps.date.month(), gps.date.day(),
+                gps.time.hour(), gps.time.minute(), gps.time.second());
+}
 
 // ====================== BOOT SCREEN ======================
-
-// Stavová hláška POD logem, světle šedá, useFontMedium()
 void splashStatus(const char *msg) {
-  // Logo je 159x145 uprostřed: horní okraj cca y=47, dolní cca y=192
-  // Pod logem necháme pruh ~40 px výšky
   const int statusY = 200;
   const int statusH = 40;
 
@@ -418,7 +612,6 @@ void splashStatus(const char *msg) {
   Serial.println(msg);
 }
 
-// Zobrazení loga při startu
 void showBootLogo() {
   tft.fillScreen(BOOT_BG);
 
@@ -427,14 +620,12 @@ void showBootLogo() {
   tft.setCursor(10, 10);
   tft.print("SAT TRACKER");
 
-  // Výpočet středu
   int x = (tft.width()  - LOGO_W) / 2;
   int y = (tft.height() - LOGO_H) / 2;
 
-  // Vykreslení loga z paměti (RGB565)
   tft.pushImage(x, y, LOGO_W, LOGO_H, logo_map);
 
-  splashStatus("Startuji tracker...");
+  splashStatus("Starting tracker...");
 }
 
 // ====================== TLE ======================
@@ -487,26 +678,22 @@ bool downloadTleForSat(SatConfig &sc, time_t nowUtc) {
 
   Serial.printf("TLE OK (download): %s\n", sc.name);
 
-  // uložit do FS s časovou známkou
   saveTleToFs(sc, nowUtc);
-
   return true;
 }
 
-// Zajistí platné TLE pro satelit:
-// 1) pokus o načtení z FS (pokud <24h)
-// 2) pokud selže, stáhne z internetu a uloží
 bool ensureTleForSat(SatConfig &sc, time_t nowUtc) {
-  // Nejdřív zkus FS cache
   if (loadTleFromFs(sc, nowUtc)) {
     return true;
   }
 
   Serial.printf("TLE FS not usable, downloading: %s\n", sc.id);
 
-  // Pokud FS selže, stáhni z webu
-  if (downloadTleForSat(sc, nowUtc)) {
-    return true;
+  // In GPS-only OFFLINE mode, do not attempt internet
+  if (!g_gpsOnlyMode && !g_isAPMode) {
+    if (downloadTleForSat(sc, nowUtc)) {
+      return true;
+    }
   }
 
   Serial.printf("TLE ensure FAILED: %s\n", sc.id);
@@ -514,7 +701,6 @@ bool ensureTleForSat(SatConfig &sc, time_t nowUtc) {
 }
 
 void initSatConfigs() {
-  // základní reset jmen a TLE
   for (int i = 0; i < SAT_COUNT; i++) {
     strncpy(g_sats[i].name, g_sats[i].defaultName, sizeof(g_sats[i].name));
     g_sats[i].name[sizeof(g_sats[i].name) - 1] = '\0';
@@ -522,7 +708,7 @@ void initSatConfigs() {
     g_sats[i].l2[0] = '\0';
   }
 
-  // fallback ISS TLE – použije se, když selže vše ostatní
+  // fallback ISS TLE
   strncpy(g_sats[0].name, "ISS (ZARYA)", sizeof(g_sats[0].name));
   strncpy(g_sats[0].l1,
           "1 25544U 98067A   25321.51385417  .00013833  00000-0  24663-3 0  9999",
@@ -532,11 +718,8 @@ void initSatConfigs() {
           sizeof(g_sats[0].l2));
 
   time_t nowUtc = time(nullptr);
-
-  // Pro každý satelit: nejdřív FS, pak download, jinak fallback (u ISS)
   for (int i = 0; i < SAT_COUNT; i++) {
     if (!ensureTleForSat(g_sats[i], nowUtc)) {
-      // Pokud je to ISS a nepodařilo se nic, nech fallback
       if (i == 0) {
         Serial.println("Using built-in fallback TLE for ISS.");
       } else {
@@ -548,15 +731,18 @@ void initSatConfigs() {
     }
   }
 
-  // Inicializace SGP4
   for (int i = 0; i < SAT_COUNT; i++) {
     g_sgp4[i].site(g_qthLat, g_qthLon, g_qthAlt);
     if (strlen(g_sats[i].l1) > 10 && strlen(g_sats[i].l2) > 10) {
       g_sgp4[i].init(g_sats[i].name, g_sats[i].l1, g_sats[i].l2);
     } else if (i == 0) {
-      // ISS fallback
       g_sgp4[0].init(g_sats[0].name, g_sats[0].l1, g_sats[0].l2);
     }
+  }
+
+  for (int i = 0; i < SAT_COUNT; i++) {
+    g_prevDistKm[i] = 0.0f;
+    g_prevDistValid[i] = false;
   }
 }
 
@@ -750,8 +936,8 @@ void dumpPassesToSerial() {
 
 // ====================== SERIAL CMD ======================
 void processCommand(const String &cmd) {
-  if (cmd.equalsIgnoreCase("pocitej")) {
-    Serial.println(F("\n[CMD] pocitej – recalculating passes for next 24h (from now) and dumping to serial..."));
+  if (cmd.equalsIgnoreCase("pocitej") || cmd.equalsIgnoreCase("recalc")) {
+    Serial.println(F("\n[CMD] recalc – recalculating passes for next 24h (from now) and dumping to serial..."));
 
     time_t nowUtc = time(nullptr);
     time_t startUtc = nowUtc;
@@ -846,11 +1032,48 @@ void drawIpFsFooter() {
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
 
   tft.fillRect(0, 218, 320, 20, TFT_BLACK);
-
   tft.setCursor(5, 228);
   tft.printf("IP:%s  FS:%s",
              g_ipStr.c_str(),
              getFSInfoString().c_str());
+}
+
+// RX/TX line (white, under radar, above IP line)
+void drawRxTxLine(int satIdx, float dopplerFactorRx, float dopplerFactorTx) {
+  const int y = 200;
+  tft.fillRect(0, y, 320, 18, TFT_BLACK);
+
+  useFontMedium();
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(5, y+2);
+
+  float rxMHz = g_sats[satIdx].rxFreqMHz;
+  float txMHz = g_sats[satIdx].txFreqMHz;
+
+  if (rxMHz <= 0 && txMHz <= 0) {
+    tft.print("RX/TX: undefined");
+    return;
+  }
+
+  tft.print("RX:");
+  if (rxMHz > 0) {
+    double rxHz   = rxMHz * 1e6;
+    double rxHzD  = g_dopplerEnabled ? rxHz * dopplerFactorRx : rxHz;
+    double rxOutM = rxHzD / 1e6;
+    tft.printf(" %.6f MHz", rxOutM);
+  } else {
+    tft.print(" -");
+  }
+
+  tft.print("  TX:");
+  if (txMHz > 0) {
+    double txHz   = txMHz * 1e6;
+    double txHzD  = g_dopplerEnabled ? txHz * dopplerFactorTx : txHz;
+    double txOutM = txHzD / 1e6;
+    tft.printf(" %.6f MHz", txOutM);
+  } else {
+    tft.print(" -");
+  }
 }
 
 void drawStaticFrame() {
@@ -865,6 +1088,29 @@ void drawStaticFrame() {
   drawIpFsFooter();
 }
 
+// AP MODE INFO SCREEN, when AP + GPS off
+void drawApModeInfo() {
+  tft.fillScreen(TFT_BLACK);
+  useFontMedium();
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+
+  tft.setCursor(10, 20);
+  tft.print("AP MODE");
+
+  tft.setCursor(10, 50);
+  tft.print("SSID: SAT_TRACKER");
+
+  tft.setCursor(10, 70);
+  tft.print("PASS: sat123456");
+
+  tft.setCursor(10, 100);
+  tft.print("IP: ");
+  tft.print(g_ipStr);
+
+  tft.setCursor(10, 130);
+  tft.print("Edit settings in browser");
+}
+
 // ====================== DRAW – PASS LIST ======================
 void drawPassList(time_t nowUtc) {
   tft.fillRect(0, 50, 320, 150, TFT_BLACK);
@@ -872,7 +1118,7 @@ void drawPassList(time_t nowUtc) {
   useFontMedium();
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 60);
-  tft.print("PRULETY:");
+  tft.print("PASSES:");
 
   int y = 90;
   int shown = 0;
@@ -915,12 +1161,23 @@ void drawPassList(time_t nowUtc) {
   if (shown == 0) {
     tft.setCursor(10, y);
     useFontMedium();
-    tft.print("Zadne prulety.");
+    if (g_gpsEnabled && !g_gpsHasFix) {
+      tft.print("Waiting for GPS...");
+    } else {
+      tft.print("No passes.");
+    }
   }
 }
 
+// ====================== DOPPLER HELPER ======================
+float dopplerFactorFromRangeRate(float rangeRateKmS) {
+  const float C_KM_S = 299792.458f;
+  return 1.0f - (rangeRateKmS / C_KM_S);
+}
+
 // ====================== DRAW – SATELLITE STATE ======================
-void drawSatState(int satIdx, const SatState& s, const tm& tmUtc) {
+// Uses local time (tmLocal) and prints it in medium font in info block
+void drawSatState(int satIdx, const SatState& s, const tm& tmLocal, float rangeRateKmS) {
   tft.fillRect(50, 60, 140, 120, TFT_BLACK);
 
   useFontMedium();
@@ -946,13 +1203,18 @@ void drawSatState(int satIdx, const SatState& s, const tm& tmUtc) {
   else if (s.vis == 0)  tft.print("DIM");
   else                  tft.print("BRIGHT");
 
+  // Local time – medium font
   tft.fillRect(50, 140, 140, 20, TFT_BLACK);
   tft.setCursor(50, 140);
-  tft.printf("%02d:%02d:%02dZ", tmUtc.tm_hour, tmUtc.tm_min, tmUtc.tm_sec);
+  tft.printf("%02d:%02d:%02d", tmLocal.tm_hour, tmLocal.tm_min, tmLocal.tm_sec);
 
   tft.fillRect(50, 160, 180, 20, TFT_BLACK);
   tft.setCursor(50, 160);
-  tft.printf("%.3fN %.3fE", g_qthLat, g_qthLon);
+  if (g_gpsEnabled && !g_gpsHasFix) {
+    tft.print("Waiting GPS...");
+  } else {
+    tft.printf("%.3fN %.3fE", g_qthLat, g_qthLon);
+  }
 
   tft.fillRect(10, 35, 200, 20, TFT_BLACK);
   tft.setCursor(10, 35);
@@ -971,6 +1233,11 @@ void drawSatState(int satIdx, const SatState& s, const tm& tmUtc) {
     int y = RADAR_CY - (int)(kr * cos(az));
     tft.fillCircle(x, y, 5, TFT_GREEN);
   }
+
+  float dopplerFactor = g_dopplerEnabled ? dopplerFactorFromRangeRate(rangeRateKmS) : 1.0f;
+  drawRxTxLine(satIdx, dopplerFactor, dopplerFactor);
+
+  drawIpFsFooter();
 }
 
 // ====================== FOOTER ======================
@@ -987,6 +1254,30 @@ void drawFooter(const tm& tmLocal) {
   tft.print(buf);
 }
 
+// ====================== GPS UPDATE ======================
+void updateGps() {
+  if (!g_gpsEnabled) return;
+
+  while (SerialGPS.available() > 0) {
+    char c = SerialGPS.read();
+    gps.encode(c);
+  }
+
+  if (gps.location.isUpdated() && gps.location.isValid()) {
+    g_qthLat = gps.location.lat();
+    g_qthLon = gps.location.lng();
+    if (gps.altitude.isValid()) {
+      g_qthAlt = gps.altitude.meters();
+    }
+    g_gpsHasFix = true;
+    updateSatSites();
+  }
+
+  if (!g_gpsTimeSet && gps.date.isValid() && gps.time.isValid()) {
+    setSystemTimeFromGps();
+  }
+}
+
 // ====================== WEB UI ======================
 String htmlEscape(const String &s) {
   String out;
@@ -1001,6 +1292,19 @@ String htmlEscape(const String &s) {
   return out;
 }
 
+// Small helper for <option>
+void addTzOption(String &html, const char* value, const char* label) {
+  html += "<option value='";
+  html += htmlEscape(value);
+  html += "'";
+  if (strcmp(g_tz, value) == 0) {
+    html += " selected";
+  }
+  html += ">";
+  html += htmlEscape(label);
+  html += "</option>";
+}
+
 void handleRoot() {
   String html = F(
     "<!DOCTYPE html><html><head>"
@@ -1009,55 +1313,134 @@ void handleRoot() {
     "<style>"
     "body{font-family:sans-serif;background:#111;color:#eee;margin:20px;}"
     "h1{color:#0ff;}"
-    "label{display:inline-block;width:80px;}"
-    ".box{border:1px solid #444;padding:10px;margin-bottom:15px;border-radius:6px;}"
-    "input[type=text]{width:100px;}"
+    "label{display:inline-block;width:110px;}"
+    ".box{border:1px solid #444;padding:10px;margin-bottom:15px;border-radius:6px;background:#181818;}"
+    "input[type=text]{width:140px;background:#222;border:1px solid #555;color:#eee;padding:2px 4px;}"
     ".satlist label{width:auto;margin-right:10px;}"
-    "button{padding:6px 12px;border-radius:4px;border:1px solid #0aa;background:#033;color:#0ff;}"
+    "button{padding:6px 12px;border-radius:4px;border:1px solid #0aa;background:#033;color:#0ff;cursor:pointer;}"
+    "button:hover{background:#055;}"
+    "select{background:#222;border:1px solid #555;color:#eee;padding:2px 4px;}"
     "</style>"
     "</head><body>"
     "<h1>Sat Tracker</h1>"
   );
 
-  html += F("<div class='box'><h2>QTH</h2><form method='POST' action='/config'>");
+  html += F("<div class='box'><h2>QTH &amp; Time</h2><form method='POST' action='/config'>");
 
-  html += F("<label>Lat:</label><input type='text' name='lat' value='");
-  html += String(g_qthLat, 4);
+  html += F("<label>Latitude:</label><input type='text' name='lat' value='");
+  html += String(g_qthLat, 6);
   html += F("'><br>");
 
-  html += F("<label>Lon:</label><input type='text' name='lon' value='");
-  html += String(g_qthLon, 4);
+  html += F("<label>Longitude:</label><input type='text' name='lon' value='");
+  html += String(g_qthLon, 6);
   html += F("'><br>");
 
-  html += F("<label>Alt:</label><input type='text' name='alt' value='");
+  html += F("<label>Altitude:</label><input type='text' name='alt' value='");
   html += String(g_qthAlt, 1);
   html += F("'> m<br>");
 
-  html += F("<label>MinEl:</label><input type='text' name='minel' value='");
+  html += F("<label>Min. elev:</label><input type='text' name='minel' value='");
   html += String(g_minElDeg, 1);
   html += F("'> &deg;<br>");
 
-  html += F("</div><div class='box'><h2>Satelity</h2><div class='satlist'>");
+  // WiFi STA settings
+  html += F("<label>WiFi SSID:</label><input type='text' name='wifi_ssid' value='");
+  html += htmlEscape(String(g_wifiSsid));
+  html += F("'><br>");
+
+  // For safety, do not prefill password – empty = keep old
+  html += F("<label>WiFi password:</label><input type='text' name='wifi_pass' value=''><small> (leave empty to keep)</small><br>");
+
+  // Timezone select
+  html += F("<label>Timezone:</label><select name='tz'>");
+  addTzOption(html, "UTC0", "UTC");
+  addTzOption(html, "CET-1CEST,M3.5.0/2,M10.5.0/3", "Europe/Prague");
+  addTzOption(html, "EET-2EEST,M3.5.0/3,M10.5.0/4", "Eastern Europe");
+  addTzOption(html, "EST5EDT,M3.2.0/2,M11.1.0/2", "US East");
+  addTzOption(html, "PST8PDT,M3.2.0/2,M11.1.0/2", "US West");
+  html += F("</select><br>");
+
+  // Doppler
+  html += F("<label>Doppler:</label><input type='checkbox' name='doppler'");
+  if (g_dopplerEnabled) html += F(" checked");
+  html += F("> apply shift<br>");
+
+  // GPS section
+  html += F("</div><div class='box'><h2>GPS</h2>");
+
+  html += F("<label>GPS enabled:</label><input type='checkbox' name='gps_en'");
+  if (g_gpsEnabled) html += F(" checked");
+  html += F("><br>");
+
+  html += F("<label>GPS only:</label><input type='checkbox' name='gps_only'");
+  if (g_gpsOnlyMode) html += F(" checked");
+  html += F("> offline mode<br>");
+
+  html += F("<label>GPS RX pin:</label><input type='text' name='gps_rx' value='");
+  html += String(g_gpsRxPin);
+  html += F("'><br>");
+
+  html += F("<label>GPS TX pin:</label><input type='text' name='gps_tx' value='");
+  html += String(g_gpsTxPin);
+  html += F("'><br>");
+
+  html += F("<label>GPS baud:</label><input type='text' name='gps_baud' value='");
+  html += String((unsigned long)g_gpsBaud);
+  html += F("'><br>");
+
+  // GPS status
+  html += F("<p>GPS status: ");
+  if (!g_gpsEnabled) {
+    html += F("disabled");
+  } else if (g_gpsEnabled && !g_gpsHasFix) {
+    html += F("waiting for fix...");
+  } else {
+    html += F("OK");
+  }
+  html += F("</p>");
+
+  // Satellites
+  html += F("</div><div class='box'><h2>Satellites</h2><div class='satlist'>");
 
   for (int i = 0; i < SAT_COUNT; i++) {
     html += "<label><input type='checkbox' name='sat_";
     html += g_sats[i].id;
     html += "'";
+
     if (g_sats[i].enabled) html += " checked";
     html += "> ";
     html += htmlEscape(g_sats[i].shortName);
     html += " (";
     html += htmlEscape(g_sats[i].defaultName);
-    html += ")</label><br>";
+    html += ")";
+
+    html += " RX:";
+    if (g_sats[i].rxFreqMHz > 0) html += String(g_sats[i].rxFreqMHz, 3);
+    else html += "-";
+    html += "MHz TX:";
+    if (g_sats[i].txFreqMHz > 0) html += String(g_sats[i].txFreqMHz, 3);
+    else html += "-";
+    html += "MHz";
+
+    html += "</label><br>";
   }
 
-  html += F("</div></div><button type='submit'>Ulozit a prepocitat</button></form>");
+  html += F("</div></div><button type='submit'>Save &amp; recalculate</button></form>");
 
+  // Info
   html += F("<div class='box'><h2>Info</h2>");
-  html += F("Aktualni IP: ");
+  html += F("Mode: ");
+  if (g_isAPMode) html += F("AP");
+  else html += F("STA");
+  html += F("<br>AP SSID: SAT_TRACKER, PASS: sat123456<br>");
+  html += F("Current IP: ");
   html += htmlEscape(g_ipStr);
-  html += F("<br>FS: ");
+  html += F("<br>FS usage: ");
   html += getFSInfoString();
+  html += F("<br>Timezone: ");
+  html += htmlEscape(String(g_tz));
+  html += F("<br>WiFi STA SSID: ");
+  html += htmlEscape(String(g_wifiSsid));
   html += F("</div>");
 
   html += F("</body></html>");
@@ -1070,6 +1453,45 @@ void handleConfig() {
   if (server.hasArg("lon"))   g_qthLon   = server.arg("lon").toFloat();
   if (server.hasArg("alt"))   g_qthAlt   = server.arg("alt").toFloat();
   if (server.hasArg("minel")) g_minElDeg = server.arg("minel").toFloat();
+
+  // WiFi settings from page
+  if (server.hasArg("wifi_ssid")) {
+    String s = server.arg("wifi_ssid");
+    s.trim();
+    if (s.length() > 0) {
+      s.toCharArray(g_wifiSsid, sizeof(g_wifiSsid));
+    }
+  }
+
+  // Password – if non-empty, change; empty = keep old
+  if (server.hasArg("wifi_pass")) {
+    String p = server.arg("wifi_pass");
+    p.trim();
+    if (p.length() > 0) {
+      p.toCharArray(g_wifiPass, sizeof(g_wifiPass));
+    }
+  }
+
+  if (server.hasArg("tz")) {
+    String tz = server.arg("tz");
+    tz.trim();
+    if (tz.length() > 0) {
+      tz.toCharArray(g_tz, sizeof(g_tz));
+      setenv("TZ", g_tz, 1);
+      tzset();
+    }
+  }
+
+  g_dopplerEnabled = server.hasArg("doppler");
+  g_gpsEnabled     = server.hasArg("gps_en");
+  g_gpsOnlyMode    = server.hasArg("gps_only");
+
+  if (server.hasArg("gps_rx")) g_gpsRxPin = server.arg("gps_rx").toInt();
+  if (server.hasArg("gps_tx")) g_gpsTxPin = server.arg("gps_tx").toInt();
+  if (server.hasArg("gps_baud")) {
+    uint32_t b = server.arg("gps_baud").toInt();
+    if (b > 0) g_gpsBaud = b;
+  }
 
   if (g_minElDeg < 0.0f) g_minElDeg = 0.0f;
   if (g_minElDeg > 90.0f) g_minElDeg = 90.0f;
@@ -1084,10 +1506,13 @@ void handleConfig() {
 
   time_t nowUtc = time(nullptr);
   time_t startUtc = nowUtc;
-  predictPasses(startUtc);
+  if (g_haveTime) {
+    predictPasses(startUtc);
+  }
 
   g_lastPassListMinute = -1;
   clearTrail();
+  g_passesInitByGps = false;
 
   drawStaticFrame();
 
@@ -1110,35 +1535,82 @@ void setup() {
 
   showBootLogo();
 
-  splashStatus("Nacitam konfiguraci...");
+  splashStatus("Loading configuration...");
   loadConfig();
 
-  splashStatus("Pripojuji WiFi...");
-  connectWiFi();
+  // If WiFi not set in config, use default constants
+  if (g_wifiSsid[0] == '\0') {
+    strncpy(g_wifiSsid, WIFI_SSID, sizeof(g_wifiSsid));
+    g_wifiSsid[sizeof(g_wifiSsid) - 1] = '\0';
+  }
+  if (g_wifiPass[0] == '\0') {
+    strncpy(g_wifiPass, WIFI_PASS, sizeof(g_wifiPass));
+    g_wifiPass[sizeof(g_wifiPass) - 1] = '\0';
+  }
 
-  splashStatus("Synchronizuji cas (NTP)...");
-  setupTime();
+  // Set TZ immediately
+  setenv("TZ", g_tz, 1);
+  tzset();
 
-  splashStatus("Inicializuji TLE a satelity...");
+  // GPS port, if enabled
+  if (g_gpsEnabled) {
+    SerialGPS.begin(g_gpsBaud, SERIAL_8N1, g_gpsRxPin, g_gpsTxPin);
+    Serial.printf("GPS enabled: RX=%d TX=%d baud=%lu\n",
+                  g_gpsRxPin, g_gpsTxPin, (unsigned long)g_gpsBaud);
+  }
+
+  bool wifiOk = false;
+
+  if (g_gpsOnlyMode) {
+    // GPS-only OFFLINE: do not start STA, go directly to AP for config
+    splashStatus("Starting AP (GPS only)...");
+    startApMode();
+  } else {
+    splashStatus("Connecting WiFi (STA)...");
+    wifiOk = connectWiFiStation();
+    if (!wifiOk) {
+      splashStatus("STA failed, starting AP...");
+      startApMode();
+    }
+  }
+
+  if (wifiOk && !g_gpsOnlyMode) {
+    splashStatus("Syncing time (NTP)...");
+    setupTimeNTP();
+  } else {
+    g_haveTime = false; // Will possibly wait for GPS
+  }
+
+  splashStatus("Initializing TLE and satellites...");
   initSatConfigs();
 
-  splashStatus("Pocitam prelety...");
-  time_t nowUtc   = time(nullptr);
-  time_t startUtc = nowUtc;
-  predictPasses(startUtc);
+  if (g_haveTime) {
+    splashStatus("Computing passes...");
+    time_t nowUtc   = time(nullptr);
+    predictPasses(nowUtc);
+  } else {
+    splashStatus("Waiting for time (NTP/GPS)...");
+  }
 
-  splashStatus("Startuji web server...");
+  splashStatus("Starting web server...");
   server.on("/", HTTP_GET, handleRoot);
   server.on("/config", HTTP_POST, handleConfig);
   server.begin();
 
-  splashStatus("Hotovo.");
+  splashStatus("Done.");
   delay(800);
 
-  drawStaticFrame();
+  // If AP + GPS off -> static AP info
+  if (g_isAPMode && !g_gpsEnabled) {
+    drawApModeInfo();
+  } else {
+    drawStaticFrame();
+  }
+
   g_lastPassListMinute = -1;
   clearTrail();
   g_displayMode = MODE_LIST;
+  g_passesInitByGps = false;
 
   Serial.println("HTTP server ready.");
 }
@@ -1146,6 +1618,16 @@ void setup() {
 // ====================== LOOP ======================
 void loop() {
   server.handleClient();
+
+  // GPS handling
+  updateGps();
+
+  // If we don't have time from NTP and GPS time just arrived -> recompute passes
+  if (!g_haveTime && g_gpsEnabled && g_gpsTimeSet && !g_passesInitByGps) {
+    time_t nowUtc = time(nullptr);
+    predictPasses(nowUtc);
+    g_passesInitByGps = true;
+  }
 
   static String cmdBuf;
   while (Serial.available() > 0) {
@@ -1167,12 +1649,15 @@ void loop() {
   if (millis() - last < 1000) return;
   last = millis();
 
+  // AP + GPS off: only static info screen
+  if (g_isAPMode && !g_gpsEnabled) {
+    // we might still update time in background if available, but leave display as is
+    return;
+  }
+
   time_t nowUtc = time(nullptr);
 
-  tm tmUtc;
-  gmtime_r(&nowUtc, &tmUtc);
-
-  tm tmLocal;
+  tm tmLocal{};
   getLocalTime(&tmLocal);
 
   int active = -1;
@@ -1205,9 +1690,20 @@ void loop() {
 
       int si = g_passes[active].satIdx;
       SatState s = computeSatellite(si, nowUtc);
-      drawSatState(si, s, tmUtc);
+
+      float rangeRateKmS = 0.0f;
+      if (g_prevDistValid[si]) {
+        rangeRateKmS = s.distKm - g_prevDistKm[si]; // dt ~= 1s
+      }
+      g_prevDistKm[si]    = s.distKm;
+      g_prevDistValid[si] = true;
+
+      drawSatState(si, s, tmLocal, rangeRateKmS);
     }
   }
 
-  drawFooter(tmLocal);
+  // Big time at the bottom only in PASS LIST mode, not in TRACKER mode
+  if (g_displayMode == MODE_LIST) {
+    drawFooter(tmLocal);
+  }
 }
