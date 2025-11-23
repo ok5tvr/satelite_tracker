@@ -375,19 +375,8 @@ void loadConfig() {
     }
   }
 
+  // FIX 1: enabled list si ZATÍM jen uložíme
   String line2 = f.readStringUntil('\n'); line2.trim();
-  for(int i=0;i<MAX_SATS_TOTAL;i++) g_sats[i].enabled=false;
-  int start=0;
-  while(start<(int)line2.length()){
-    int sp=line2.indexOf(' ',start);
-    if(sp<0) sp=line2.length();
-    String token=line2.substring(start,sp); token.trim();
-    if(token.length()>0){
-      for(int i=0;i<BUILTIN_COUNT;i++)
-        if(token.equalsIgnoreCase(g_sats[i].id)) g_sats[i].enabled=true;
-    }
-    start=sp+1;
-  }
 
   String line3 = f.readStringUntil('\n'); line3.trim();
   if(line3.length()>0) line3.toCharArray(g_tz,sizeof(g_tz));
@@ -408,8 +397,36 @@ void loadConfig() {
   }
   f.close();
 
-  // načti custom saty (rozšíří SAT_COUNT)
+  // FIX 1: nejdřív načti custom saty (rozšíří SAT_COUNT)
   loadCustomSats();
+
+  // FIX 1: a teprve teď aplikuj enabled tokeny pro VŠECHNY saty
+  for(int i=0;i<MAX_SATS_TOTAL;i++) g_sats[i].enabled=false;
+
+  int start=0;
+  while(start<(int)line2.length()){
+    int sp=line2.indexOf(' ',start);
+    if(sp<0) sp=line2.length();
+    String token=line2.substring(start,sp); token.trim();
+    if(token.length()>0){
+      for(int i=0;i<SAT_COUNT;i++){
+        if(token.equalsIgnoreCase(g_sats[i].id)){
+          g_sats[i].enabled=true;
+          break;
+        }
+      }
+    }
+    start=sp+1;
+  }
+
+  // enforce max 4 enabled
+  int en=0;
+  for(int i=0;i<SAT_COUNT;i++){
+    if(g_sats[i].enabled){
+      en++;
+      if(en>MAX_SATS_SELECTED) g_sats[i].enabled=false;
+    }
+  }
 }
 
 void saveConfig() {
@@ -1113,10 +1130,11 @@ void handleRoot(){
     html+="MHz TX:"; html+=(g_sats[i].txFreqMHz>0)?String(g_sats[i].txFreqMHz,3):"-";
     html+="MHz</label>";
 
+    // FIX 2: žádný vnořený form – použij formaction na tlačítku
     if(g_sats[i].isCustom){
-      html+=" <form style='display:inline' method='POST' action='/sat/del'>"
-            "<input type='hidden' name='i' value='"+String(i)+"'>"
-            "<button type='submit' style='margin-left:6px'>Delete</button></form>";
+      html+=" <button type='submit' name='i' value='"+String(i)+"' "
+            "formaction='/sat/del' formmethod='POST' "
+            "style='margin-left:6px'>Delete</button>";
     }
     html+="<br>";
   }
