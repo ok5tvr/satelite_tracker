@@ -8,6 +8,8 @@
 //  - Configurable timezone (POSIX TZ strings via <select>)
 //  - RX/TX frequencies for satellites + Doppler shift
 //  - Cached pass track on radar
+//  - NEW: add/delete custom satellites via web + save to SPIFFS
+//  - NEW: max 4 enabled satellites for pass prediction
 
 #define SMOOTH_FONT
 #define LOAD_GFXFF
@@ -86,6 +88,13 @@ bool   g_isAPMode = false;
 // ====================== WEB SERVER ======================
 WebServer server(80);
 
+// ====================== SAT LIMITS ======================
+static const uint8_t MAX_SATS_SELECTED = 4;  // max vybraných pro výpočet
+static const uint8_t BUILTIN_COUNT     = 4;  // pevně v kódu
+static const uint8_t MAX_SATS_TOTAL    = 12; // kapacita builtin + custom
+
+const char* PATH_SATS = "/sats.txt";
+
 // ====================== SATELLITES ======================
 struct SatConfig {
   const char* id;
@@ -101,37 +110,51 @@ struct SatConfig {
   float txFreqMHz;
 
   bool  enabled;
+  bool  isCustom;
 };
 
-SatConfig g_sats[] = {
+// pevná kapacita pole
+SatConfig g_sats[MAX_SATS_TOTAL] = {
   {
     "ISS","ISS","ISS (ZARYA)",
     "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=tle",
     "", "", "",
-    145.800f, 437.800f, true
+    437.800f, 145.800f, true,
+    false
   },
   {
     "SO50","SO50","SO-50",
     "https://celestrak.org/NORAD/elements/gp.php?NAME=SO-50&FORMAT=tle",
     "", "", "",
-    436.795f,145.850f,false
+    436.795f,145.850f,false,
+    false
   },
   {
     "FO29","FO29","FO-29",
     "https://celestrak.org/NORAD/elements/gp.php?NAME=FO-29&FORMAT=tle",
     "", "", "",
-    435.850f,145.900f,false
+    435.850f,145.900f,false,
+    false
   },
+  // AO-91 nahrazen UmKA-1 (RS40S)
   {
-    "AO91","AO91","AO-91",
-    "https://celestrak.org/NORAD/elements/gp.php?NAME=AO-91&FORMAT=tle",
+    "UMKA1","UmKA-1","UmKA-1 (RS40S)",
+    "https://celestrak.org/NORAD/elements/gp.php?CATNR=57172&FORMAT=tle",
     "", "", "",
-    145.960f,435.250f,false
+    437.625f,145.850f,false,  // RX downlink / TX uplink
+    false
   }
+  // zbytek jsou prázdné custom sloty
 };
 
-const int SAT_COUNT = sizeof(g_sats) / sizeof(g_sats[0]);
-Sgp4 g_sgp4[SAT_COUNT];
+int  SAT_COUNT = BUILTIN_COUNT;
+Sgp4 g_sgp4[MAX_SATS_TOTAL];
+
+// buffers pro custom satelity (aby const char* ukazovaly do stabilní paměti)
+char g_customIdBuf[MAX_SATS_TOTAL][8];
+char g_customShortBuf[MAX_SATS_TOTAL][16];
+char g_customDefBuf[MAX_SATS_TOTAL][32];
+char g_customUrlBuf[MAX_SATS_TOTAL][96];
 
 // ====================== PASS / TRAIL ======================
 struct SatState {
@@ -164,8 +187,8 @@ TrailPoint g_trail[TRAIL_LEN];
 int g_trailCount   = 0;
 int g_trailPassIdx = -1;
 
-float g_prevDistKm[SAT_COUNT];
-bool  g_prevDistValid[SAT_COUNT];
+float g_prevDistKm[MAX_SATS_TOTAL];
+bool  g_prevDistValid[MAX_SATS_TOTAL];
 
 // ====================== DISPLAY MODE ======================
 enum DisplayMode { MODE_LIST, MODE_TRACKER };
@@ -250,12 +273,86 @@ bool loadTleFromFs(SatConfig &sc, time_t nowUtc) {
   return true;
 }
 
+// ===== CUSTOM SATS LOAD/SAVE =====
+// formát řádku: ID|shortName|defaultName|tleUrl|rxMHz|txMHz|enabled
+void saveCustomSats(){
+  File f = SPIFFS.open(PATH_SATS, FILE_WRITE);
+  if(!f) return;
+
+  for(int i=BUILTIN_COUNT;i<SAT_COUNT;i++){
+    SatConfig &s = g_sats[i];
+    if(!s.isCustom) continue;
+    f.print(s.id); f.print("|");
+    f.print(s.shortName); f.print("|");
+    f.print(s.defaultName); f.print("|");
+    f.print(s.tleUrl); f.print("|");
+    f.print(String(s.rxFreqMHz,6)); f.print("|");
+    f.print(String(s.txFreqMHz,6)); f.print("|");
+    f.println(s.enabled ? "1" : "0");
+  }
+  f.close();
+}
+
+void loadCustomSats(){
+  File f = SPIFFS.open(PATH_SATS, FILE_READ);
+  SAT_COUNT = BUILTIN_COUNT;
+  if(!f) return;
+
+  while(f.available() && SAT_COUNT < MAX_SATS_TOTAL){
+    String line = f.readStringUntil('\n'); line.trim();
+    if(line.length()==0) continue;
+
+    String parts[7];
+    int p=0, start=0;
+    while(p<7){
+      int sep=line.indexOf('|',start);
+      if(sep<0){ parts[p++]=line.substring(start); break; }
+      parts[p++]=line.substring(start,sep);
+      start=sep+1;
+    }
+    if(p<6) continue;
+
+    SatConfig &s = g_sats[SAT_COUNT];
+    memset(&s,0,sizeof(SatConfig));
+
+    parts[0].toCharArray(g_customIdBuf[SAT_COUNT], sizeof(g_customIdBuf[SAT_COUNT]));
+    parts[1].toCharArray(g_customShortBuf[SAT_COUNT], sizeof(g_customShortBuf[SAT_COUNT]));
+    parts[2].toCharArray(g_customDefBuf[SAT_COUNT], sizeof(g_customDefBuf[SAT_COUNT]));
+    parts[3].toCharArray(g_customUrlBuf[SAT_COUNT], sizeof(g_customUrlBuf[SAT_COUNT]));
+
+    s.id = g_customIdBuf[SAT_COUNT];
+    s.shortName = g_customShortBuf[SAT_COUNT];
+    s.defaultName = g_customDefBuf[SAT_COUNT];
+    s.tleUrl = g_customUrlBuf[SAT_COUNT];
+
+    strncpy(s.name, s.defaultName, sizeof(s.name));
+    s.l1[0]='\0'; s.l2[0]='\0';
+    s.rxFreqMHz = parts[4].toFloat();
+    s.txFreqMHz = parts[5].toFloat();
+    s.enabled   = (p>=7) ? (parts[6].toInt()!=0) : false;
+    s.isCustom  = true;
+
+    SAT_COUNT++;
+  }
+  f.close();
+
+  // enforce max 4 enabled
+  int en=0;
+  for(int i=0;i<SAT_COUNT;i++){
+    if(g_sats[i].enabled){
+      en++;
+      if(en>MAX_SATS_SELECTED) g_sats[i].enabled=false;
+    }
+  }
+}
+
 // ===== CONFIG LOAD / SAVE =====
 void loadConfig() {
   File f = SPIFFS.open(PATH_CONFIG, FILE_READ);
   if (!f) {
     Serial.println("Config not found, using defaults.");
     strncpy(g_tz, TZ_EU_PRAGUE, sizeof(g_tz));
+    loadCustomSats();
     return;
   }
 
@@ -279,14 +376,14 @@ void loadConfig() {
   }
 
   String line2 = f.readStringUntil('\n'); line2.trim();
-  for(int i=0;i<SAT_COUNT;i++) g_sats[i].enabled=false;
+  for(int i=0;i<MAX_SATS_TOTAL;i++) g_sats[i].enabled=false;
   int start=0;
   while(start<(int)line2.length()){
     int sp=line2.indexOf(' ',start);
     if(sp<0) sp=line2.length();
     String token=line2.substring(start,sp); token.trim();
     if(token.length()>0){
-      for(int i=0;i<SAT_COUNT;i++)
+      for(int i=0;i<BUILTIN_COUNT;i++)
         if(token.equalsIgnoreCase(g_sats[i].id)) g_sats[i].enabled=true;
     }
     start=sp+1;
@@ -310,6 +407,9 @@ void loadConfig() {
     }
   }
   f.close();
+
+  // načti custom saty (rozšíří SAT_COUNT)
+  loadCustomSats();
 }
 
 void saveConfig() {
@@ -329,6 +429,8 @@ void saveConfig() {
   f.print(g_wifiSsid); f.print("|"); f.println(g_wifiPass);
 
   f.close();
+
+  saveCustomSats();
 }
 
 // ====================== WIFI / AP ======================
@@ -474,10 +576,13 @@ bool ensureTleForSat(SatConfig &sc, time_t nowUtc){
 
 void initSatConfigs(){
   for(int i=0;i<SAT_COUNT;i++){
-    strncpy(g_sats[i].name,g_sats[i].defaultName,sizeof(g_sats[i].name));
+    if(!g_sats[i].isCustom){
+      strncpy(g_sats[i].name,g_sats[i].defaultName,sizeof(g_sats[i].name));
+    }
     g_sats[i].l1[0]='\0'; g_sats[i].l2[0]='\0';
   }
 
+  // fallback TLE pro ISS
   strncpy(g_sats[0].name,"ISS (ZARYA)",sizeof(g_sats[0].name));
   strncpy(g_sats[0].l1,"1 25544U 98067A   25321.51385417  .00013833  00000-0  24663-3 0  9999",sizeof(g_sats[0].l1));
   strncpy(g_sats[0].l2,"2 25544  51.6416 307.6127 0004374 279.5544  80.5053 15.50090446 99999",sizeof(g_sats[0].l2));
@@ -812,7 +917,7 @@ void updateGps(){
     setSystemTimeFromGps();
 }
 
-// ====================== WEB UI ======================
+// ====================== WEB UI HELPERS ======================
 String htmlEscape(const String &s){
   String out;
   for(size_t i=0;i<s.length();i++){
@@ -832,6 +937,100 @@ void addTzOption(String &html,const char* value,const char* label){
   html+=">"; html+=htmlEscape(label); html+="</option>";
 }
 
+// ====================== CUSTOM SAT ADD/DEL ======================
+String makeCustomId(){
+  int n=1;
+  while(true){
+    String id="C"+String(n);
+    bool used=false;
+    for(int i=BUILTIN_COUNT;i<SAT_COUNT;i++){
+      if(g_sats[i].isCustom && id.equalsIgnoreCase(g_sats[i].id)) { used=true; break; }
+    }
+    if(!used) return id;
+    n++;
+  }
+}
+
+void handleAddSat(){
+  String name = server.arg("name"); name.trim();
+  String tle  = server.arg("tle"); tle.trim();
+  float rx = server.arg("rx").toFloat();
+  float tx = server.arg("tx").toFloat();
+
+  if(name.length()<1 || rx<=0){
+    server.send(400,"text/plain","Bad input (name + RX required).");
+    return;
+  }
+  if(SAT_COUNT>=MAX_SATS_TOTAL){
+    server.send(400,"text/plain","No free custom slots.");
+    return;
+  }
+
+  SatConfig &s = g_sats[SAT_COUNT];
+  memset(&s,0,sizeof(SatConfig));
+
+  String id = makeCustomId();
+  id.toCharArray(g_customIdBuf[SAT_COUNT],sizeof(g_customIdBuf[SAT_COUNT]));
+  name.toCharArray(g_customShortBuf[SAT_COUNT],sizeof(g_customShortBuf[SAT_COUNT]));
+  name.toCharArray(g_customDefBuf[SAT_COUNT],sizeof(g_customDefBuf[SAT_COUNT]));
+  tle.toCharArray(g_customUrlBuf[SAT_COUNT],sizeof(g_customUrlBuf[SAT_COUNT]));
+
+  s.id = g_customIdBuf[SAT_COUNT];
+  s.shortName = g_customShortBuf[SAT_COUNT];
+  s.defaultName = g_customDefBuf[SAT_COUNT];
+  s.tleUrl = g_customUrlBuf[SAT_COUNT];
+
+  strncpy(s.name, s.defaultName, sizeof(s.name));
+  s.l1[0]='\0'; s.l2[0]='\0';
+  s.rxFreqMHz = rx;
+  s.txFreqMHz = tx;
+  s.enabled   = false; // nepovoluj automaticky
+  s.isCustom  = true;
+
+  SAT_COUNT++;
+
+  saveCustomSats();
+  initSatConfigs();
+  if(g_haveTime) predictPasses(time(nullptr));
+
+  server.sendHeader("Location","/");
+  server.send(303);
+}
+
+void handleDelSat(){
+  int idx = server.arg("i").toInt();
+  if(idx < BUILTIN_COUNT || idx >= SAT_COUNT){
+    server.send(400,"text/plain","Bad index.");
+    return;
+  }
+
+  // zrekonstruuj seznam custom satů bez idx
+  File f = SPIFFS.open(PATH_SATS, FILE_WRITE);
+  if(f){
+    for(int i=BUILTIN_COUNT;i<SAT_COUNT;i++){
+      if(i==idx) continue;
+      SatConfig &s = g_sats[i];
+      if(!s.isCustom) continue;
+      f.print(s.id); f.print("|");
+      f.print(s.shortName); f.print("|");
+      f.print(s.defaultName); f.print("|");
+      f.print(s.tleUrl); f.print("|");
+      f.print(String(s.rxFreqMHz,6)); f.print("|");
+      f.print(String(s.txFreqMHz,6)); f.print("|");
+      f.println(s.enabled ? "1" : "0");
+    }
+    f.close();
+  }
+
+  loadCustomSats();
+  initSatConfigs();
+  if(g_haveTime) predictPasses(time(nullptr));
+
+  server.sendHeader("Location","/");
+  server.send(303);
+}
+
+// ====================== WEB UI ======================
 void handleRoot(){
   String html=F(
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
@@ -904,6 +1103,7 @@ void handleRoot(){
   html+=F("</p>");
 
   html+=F("</div><div class='box'><h2>Satellites</h2><div class='satlist'>");
+
   for(int i=0;i<SAT_COUNT;i++){
     html+="<label><input type='checkbox' name='sat_"; html+=g_sats[i].id; html+="'";
     if(g_sats[i].enabled) html+=" checked";
@@ -911,10 +1111,33 @@ void handleRoot(){
     html+=" ("; html+=htmlEscape(g_sats[i].defaultName); html+=")";
     html+=" RX:"; html+=(g_sats[i].rxFreqMHz>0)?String(g_sats[i].rxFreqMHz,3):"-";
     html+="MHz TX:"; html+=(g_sats[i].txFreqMHz>0)?String(g_sats[i].txFreqMHz,3):"-";
-    html+="MHz</label><br>";
+    html+="MHz</label>";
+
+    if(g_sats[i].isCustom){
+      html+=" <form style='display:inline' method='POST' action='/sat/del'>"
+            "<input type='hidden' name='i' value='"+String(i)+"'>"
+            "<button type='submit' style='margin-left:6px'>Delete</button></form>";
+    }
+    html+="<br>";
+  }
+
+  int enabledCount=0;
+  for(int i=0;i<SAT_COUNT;i++) if(g_sats[i].enabled) enabledCount++;
+  if(enabledCount>MAX_SATS_SELECTED){
+    html+=F("<p style='color:#f66'>Warning: more than 4 satellites selected, extra will be disabled on save.</p>");
   }
 
   html+=F("</div></div><button type='submit'>Save &amp; recalculate</button></form>");
+
+  // ---- ADD SAT FORM ----
+  html+=F("<div class='box'><h2>Add satellite</h2>"
+          "<form method='POST' action='/sat/add'>"
+          "<label>Name:</label><input type='text' name='name' required><br>"
+          "<label>TLE URL:</label><input type='text' name='tle' placeholder='https://...tle' style='width:260px'><br>"
+          "<label>RX MHz:</label><input type='text' name='rx' required><br>"
+          "<label>TX MHz:</label><input type='text' name='tx'><br>"
+          "<button type='submit'>Add</button></form></div>");
+
   html+=F("<div class='box'><h2>Info</h2>");
   html+=F("Mode: "); html+=(g_isAPMode?"AP":"STA");
   html+=F("<br>AP SSID: SAT_TRACKER, PASS: sat123456<br>");
@@ -964,6 +1187,17 @@ void handleConfig(){
   for(int i=0;i<SAT_COUNT;i++){
     String argName=String("sat_")+g_sats[i].id;
     g_sats[i].enabled=server.hasArg(argName);
+  }
+
+  // ---- enforce max 4 enabled ----
+  int en=0;
+  for(int i=0;i<SAT_COUNT;i++){
+    if(g_sats[i].enabled){
+      en++;
+      if(en>MAX_SATS_SELECTED){
+        g_sats[i].enabled=false;
+      }
+    }
   }
 
   saveConfig();
@@ -1045,6 +1279,8 @@ void setup(){
   splashStatus("Starting web server...");
   server.on("/",HTTP_GET,handleRoot);
   server.on("/config",HTTP_POST,handleConfig);
+  server.on("/sat/add",HTTP_POST,handleAddSat);
+  server.on("/sat/del",HTTP_POST,handleDelSat);
   server.begin();
 
   splashStatus("Done.");
