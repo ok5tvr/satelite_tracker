@@ -8,8 +8,11 @@
 //  - Configurable timezone (POSIX TZ strings via <select>)
 //  - RX/TX frequencies for satellites + Doppler shift
 //  - Cached pass track on radar
-//  - NEW: add/delete custom satellites via web + save to SPIFFS
-//  - NEW: max 4 enabled satellites for pass prediction
+//  - add/delete custom satellites via web + save to SPIFFS
+//  - max 4 enabled satellites for pass prediction
+//  - Maidenhead locator from GPS/QTH + show on passes screen only
+//  - raw GPS string on web auto-updated without reload
+//  - LIVE update of Lat/Lon/Alt in web without refresh
 
 #define SMOOTH_FONT
 #define LOAD_GFXFF
@@ -39,11 +42,16 @@ char g_wifiPass[65] = "";
 // ====================== TIMEZONE DEFAULT ======================
 const char* TZ_EU_PRAGUE = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
-// ====================== QTH ======================
+// ====================== QTH (stored) ======================
 double g_qthLat = 49.7501;
 double g_qthLon = 13.3800;
 double g_qthAlt = 310.0;
 float  g_minElDeg = 10.0f;
+
+// ====================== LIVE GPS POSITION (not stored until Save) ======================
+double g_gpsLat = NAN;
+double g_gpsLon = NAN;
+double g_gpsAlt = NAN;
 
 // ====================== DOPPLER ======================
 bool   g_dopplerEnabled = false;
@@ -52,15 +60,18 @@ bool   g_dopplerEnabled = false;
 bool   g_haveTime = false;
 char   g_tz[64] = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
+// Prefer NTP time when WiFi OK
+bool   g_ntpPreferred = false;
+
 // ====================== GPS ======================
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(1);
 
 bool     g_gpsEnabled   = false;
 bool     g_gpsOnlyMode  = false;
-int      g_gpsRxPin     = 16;
-int      g_gpsTxPin     = 17;
-uint32_t g_gpsBaud      = 9600;
+int      g_gpsRxPin     = 26;   // ESP32 RX  <- GPS TX
+int      g_gpsTxPin     = 27;   // ESP32 TX  -> GPS RX
+uint32_t g_gpsBaud      = 4800;
 
 bool     g_gpsHasFix    = false;
 bool     g_gpsTimeSet   = false;
@@ -68,6 +79,10 @@ bool     g_gpsTimeSet   = false;
 // Flag to avoid repeated recomputation
 bool     g_passesInitByGps  = false;
 bool     g_passesInitByTime = false;  // FIX: pro pozdní NTP po timeoutu
+
+// --- Maidenhead locator + raw GPS string ---
+String g_locatorStr = "------";     // 6 znaků, formát AA00aa (JN69ps)
+String g_lastGpsSentence = "";      // poslední přijatá NMEA věta
 
 // ====================== TFT & BACKLIGHT ======================
 TFT_eSPI tft = TFT_eSPI();
@@ -243,7 +258,7 @@ bool loadTleFromFs(SatConfig &sc, time_t nowUtc) {
   time_t ts = (time_t)line.toInt();
   if (ts <= 0) { f.close(); return false; }
 
-  // FIX: bez validního času neřeš age check
+  // bez validního času neřeš age check
   if (nowUtc < 1672531200) {
     String name = f.readStringUntil('\n'); name.trim();
     String l1   = f.readStringUntil('\n'); l1.trim();
@@ -274,7 +289,6 @@ bool loadTleFromFs(SatConfig &sc, time_t nowUtc) {
 }
 
 // ===== CUSTOM SATS LOAD/SAVE =====
-// formát řádku: ID|shortName|defaultName|tleUrl|rxMHz|txMHz|enabled
 void saveCustomSats(){
   File f = SPIFFS.open(PATH_SATS, FILE_WRITE);
   if(!f) return;
@@ -375,9 +389,7 @@ void loadConfig() {
     }
   }
 
-  // FIX 1: enabled list si ZATÍM jen uložíme
   String line2 = f.readStringUntil('\n'); line2.trim();
-
   String line3 = f.readStringUntil('\n'); line3.trim();
   if(line3.length()>0) line3.toCharArray(g_tz,sizeof(g_tz));
   else strncpy(g_tz,TZ_EU_PRAGUE,sizeof(g_tz));
@@ -397,10 +409,8 @@ void loadConfig() {
   }
   f.close();
 
-  // FIX 1: nejdřív načti custom saty (rozšíří SAT_COUNT)
   loadCustomSats();
 
-  // FIX 1: a teprve teď aplikuj enabled tokeny pro VŠECHNY saty
   for(int i=0;i<MAX_SATS_TOTAL;i++) g_sats[i].enabled=false;
 
   int start=0;
@@ -419,7 +429,6 @@ void loadConfig() {
     start=sp+1;
   }
 
-  // enforce max 4 enabled
   int en=0;
   for(int i=0;i<SAT_COUNT;i++){
     if(g_sats[i].enabled){
@@ -446,7 +455,6 @@ void saveConfig() {
   f.print(g_wifiSsid); f.print("|"); f.println(g_wifiPass);
 
   f.close();
-
   saveCustomSats();
 }
 
@@ -478,7 +486,6 @@ void startApMode() {
 
 // ====================== NTP (UTC + TZ) ======================
 void setupTimeNTP() {
-  // FIX: spolehlivé TZ + SNTP
   configTzTime(g_tz, "pool.ntp.org");
 
   Serial.print("NTP sync");
@@ -820,8 +827,10 @@ void drawPassList(time_t nowUtc){
   tft.fillRect(0,50,320,150,TFT_BLACK);
   useFontMedium();
   tft.setTextColor(TFT_WHITE,TFT_BLACK);
+
+  // --- LOC + PASSES on one line ---
   tft.setCursor(10,60);
-  tft.print("PASSES:");
+  tft.printf("LOC: %s  PASSES:", g_locatorStr.c_str());
 
   int y=90, shown=0;
   for(int i=0;i<g_passCount && shown<7;i++){
@@ -916,22 +925,107 @@ void drawFooter(const tm& tmLocal){
   tft.print(buf);
 }
 
+// ====================== MAIDENHEAD LOCATOR ======================
+String maidenheadFromLatLon(double lat, double lon){
+  if(lat >  90) lat =  90;
+  if(lat < -90) lat = -90;
+  while(lon < -180) lon += 360;
+  while(lon >= 180) lon -= 360;
+
+  double adjLon = lon + 180.0;
+  double adjLat = lat +  90.0;
+
+  int A = (int)floor(adjLon / 20.0);
+  int B = (int)floor(adjLat / 10.0);
+
+  double rLon = adjLon - A*20.0;
+  double rLat = adjLat - B*10.0;
+
+  int C = (int)floor(rLon / 2.0);
+  int D = (int)floor(rLat / 1.0);
+
+  rLon -= C*2.0;
+  rLat -= D*1.0;
+
+  int E = (int)floor(rLon * 12.0);
+  int F = (int)floor(rLat * 24.0);
+
+  A = constrain(A, 0, 17);
+  B = constrain(B, 0, 17);
+  C = constrain(C, 0, 9);
+  D = constrain(D, 0, 9);
+  E = constrain(E, 0, 23);
+  F = constrain(F, 0, 23);
+
+  char loc[7];
+  loc[0] = 'A' + A;
+  loc[1] = 'A' + B;
+  loc[2] = '0' + C;
+  loc[3] = '0' + D;
+  loc[4] = 'A' + E;
+  loc[5] = 'A' + F;
+  loc[6] = '\0';
+
+  // výsledný formát AA00aa (např. JN69ps)
+  char out[7];
+  out[0] = loc[0];
+  out[1] = loc[1];
+  out[2] = loc[2];
+  out[3] = loc[3];
+  out[4] = (char)tolower(loc[4]);
+  out[5] = (char)tolower(loc[5]);
+  out[6] = '\0';
+
+  return String(out);
+}
+
+void updateLocatorFromQth(){
+  g_locatorStr = maidenheadFromLatLon(g_qthLat, g_qthLon);
+}
+void updateLocatorFromGps(){
+  if(isnan(g_gpsLat) || isnan(g_gpsLon)) return;
+  g_locatorStr = maidenheadFromLatLon(g_gpsLat, g_gpsLon);
+}
+
 // ====================== GPS UPDATE ======================
 void updateGps(){
-  if(!g_gpsEnabled) return;
+  static String nmeaBuf;
+
   while(SerialGPS.available()>0){
-    char c=SerialGPS.read();
+    char c = SerialGPS.read();
     gps.encode(c);
+
+    if(c == '\r' || c == '\n'){
+      if(nmeaBuf.length() > 0){
+        String line = nmeaBuf;
+        nmeaBuf = "";
+        line.trim();
+        if(line.length() > 0){
+          g_lastGpsSentence = line;
+        }
+      }
+      continue;
+    }
+
+    if(nmeaBuf.length() < 180) nmeaBuf += c;
+    else nmeaBuf = "";
   }
+
   if(gps.location.isUpdated() && gps.location.isValid()){
-    g_qthLat=gps.location.lat();
-    g_qthLon=gps.location.lng();
-    if(gps.altitude.isValid()) g_qthAlt=gps.altitude.meters();
+    g_gpsLat = gps.location.lat();
+    g_gpsLon = gps.location.lng();
+    if(gps.altitude.isValid()) g_gpsAlt = gps.altitude.meters();
     g_gpsHasFix=true;
-    updateSatSites();
+
+    // Locator zobrazuj z GPS jen když je GPS enabled
+    if(g_gpsEnabled) updateLocatorFromGps();
   }
-  if(!g_gpsTimeSet && gps.date.isValid() && gps.time.isValid())
+
+  // Nastav čas z GPS jen pokud NTP není preferované a GPS enabled
+  if(g_gpsEnabled && !g_ntpPreferred && !g_gpsTimeSet &&
+     gps.date.isValid() && gps.time.isValid()){
     setSystemTimeFromGps();
+  }
 }
 
 // ====================== WEB UI HELPERS ======================
@@ -1001,7 +1095,7 @@ void handleAddSat(){
   s.l1[0]='\0'; s.l2[0]='\0';
   s.rxFreqMHz = rx;
   s.txFreqMHz = tx;
-  s.enabled   = false; // nepovoluj automaticky
+  s.enabled   = false;
   s.isCustom  = true;
 
   SAT_COUNT++;
@@ -1021,7 +1115,6 @@ void handleDelSat(){
     return;
   }
 
-  // zrekonstruuj seznam custom satů bez idx
   File f = SPIFFS.open(PATH_SATS, FILE_WRITE);
   if(f){
     for(int i=BUILTIN_COUNT;i<SAT_COUNT;i++){
@@ -1048,6 +1141,37 @@ void handleDelSat(){
 }
 
 // ====================== WEB UI ======================
+
+// raw GPS sentence always (even if GPS disabled)
+void handleGpsRaw(){
+  if(g_lastGpsSentence.length()==0){
+    server.send(200, "text/plain", "-");
+    return;
+  }
+  server.send(200, "text/plain", g_lastGpsSentence);
+}
+
+// NEW: live GPS position for web auto-update
+void handleGpsPos(){
+  String json = "{";
+  json += "\"fix\":"; json += (g_gpsHasFix ? "true" : "false"); json += ",";
+  json += "\"gpsEnabled\":"; json += (g_gpsEnabled ? "true" : "false"); json += ",";
+
+  json += "\"lat\":";
+  json += isnan(g_gpsLat) ? "null" : String(g_gpsLat,6);
+  json += ",";
+
+  json += "\"lon\":";
+  json += isnan(g_gpsLon) ? "null" : String(g_gpsLon,6);
+  json += ",";
+
+  json += "\"alt\":";
+  json += isnan(g_gpsAlt) ? "null" : String(g_gpsAlt,1);
+
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 void handleRoot(){
   String html=F(
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
@@ -1065,6 +1189,7 @@ void handleRoot(){
 
   html+=F("<div class='box'><h2>QTH &amp; Time</h2><form method='POST' action='/config'>");
 
+  // při načtení stránky ukážeme uložené QTH (live GPS pak přepíše JS)
   html+=F("<label>Latitude:</label><input type='text' name='lat' value='");
   html+=String(g_qthLat,6); html+=F("'><br>");
 
@@ -1114,8 +1239,7 @@ void handleRoot(){
   html+=String((unsigned long)g_gpsBaud); html+=F("'><br>");
 
   html+=F("<p>GPS status: ");
-  if(!g_gpsEnabled) html+=F("disabled");
-  else if(!g_gpsHasFix) html+=F("waiting for fix...");
+  if(!g_gpsHasFix) html+=F("waiting for fix...");
   else html+=F("OK");
   html+=F("</p>");
 
@@ -1130,7 +1254,6 @@ void handleRoot(){
     html+="MHz TX:"; html+=(g_sats[i].txFreqMHz>0)?String(g_sats[i].txFreqMHz,3):"-";
     html+="MHz</label>";
 
-    // FIX 2: žádný vnořený form – použij formaction na tlačítku
     if(g_sats[i].isCustom){
       html+=" <button type='submit' name='i' value='"+String(i)+"' "
             "formaction='/sat/del' formmethod='POST' "
@@ -1156,6 +1279,83 @@ void handleRoot(){
           "<label>TX MHz:</label><input type='text' name='tx'><br>"
           "<button type='submit'>Add</button></form></div>");
 
+  // ---- PASSES BOX + LOCATOR ----
+  html += F("<div class='box'><h2>Passes</h2>");
+  html += F("<div style='margin-bottom:6px;font-size:18px;'>LOC: <b>");
+  html += htmlEscape(g_locatorStr);
+  html += F("</b></div>");
+  html += F("<div style='font-size:18px;margin-bottom:6px;'>PASSES:</div>");
+
+  if(g_haveTime && g_passCount>0){
+    int shown=0;
+    time_t nowUtc=time(nullptr);
+    for(int i=0;i<g_passCount && shown<7;i++){
+      const PassInfo &p=g_passes[i];
+      if(p.los<=nowUtc) continue;
+
+      tm a,l; localtime_r(&p.aos,&a); localtime_r(&p.los,&l);
+      int si=p.satIdx; const char* label=g_sats[si].shortName;
+
+      char row[96];
+      snprintf(row,sizeof(row),
+               "%s %02d.%02d %02d:%02d-%02d:%02d  max %.0f&deg;<br>",
+               label,
+               a.tm_mday,a.tm_mon+1,
+               a.tm_hour,a.tm_min,
+               l.tm_hour,l.tm_min,
+               p.maxEl);
+
+      html += row;
+      shown++;
+    }
+    if(shown==0) html += F("<i>No upcoming passes.</i><br>");
+  } else {
+    html += F("<i>Waiting for time / TLE...</i><br>");
+  }
+  html += F("</div>");
+
+  // ---- GPS RAW AUTO UPDATE + LIVE QTH FIELDS ----
+  html += F(
+    "<div class='box'><h2>GPS raw</h2>"
+    "<div id='gpsraw' style='font-family:monospace;color:#0f0;'>-</div>"
+    "</div>"
+    "<script>"
+    "const latEl=document.querySelector(\"input[name='lat']\");"
+    "const lonEl=document.querySelector(\"input[name='lon']\");"
+    "const altEl=document.querySelector(\"input[name='alt']\");"
+
+    "function isEditing(el){"
+    "  return document.activeElement===el || el.dataset.dirty==='1';"
+    "}"
+    "latEl.addEventListener('input',()=>latEl.dataset.dirty='1');"
+    "lonEl.addEventListener('input',()=>lonEl.dataset.dirty='1');"
+    "altEl.addEventListener('input',()=>altEl.dataset.dirty='1');"
+
+    "async function pollGpsRaw(){"
+    "  try{"
+    "    const r=await fetch('/gpsraw',{cache:'no-store'});"
+    "    const t=await r.text();"
+    "    document.getElementById('gpsraw').textContent=t||'-';"
+    "  }catch(e){}"
+    "}"
+
+    "async function pollGpsPos(){"
+    "  try{"
+    "    const r=await fetch('/gpspos',{cache:'no-store'});"
+    "    const j=await r.json();"
+    "    if(j && j.gpsEnabled && j.fix){"
+    "      if(j.lat!==null && !isEditing(latEl)) latEl.value=Number(j.lat).toFixed(6);"
+    "      if(j.lon!==null && !isEditing(lonEl)) lonEl.value=Number(j.lon).toFixed(6);"
+    "      if(j.alt!==null && !isEditing(altEl)) altEl.value=Number(j.alt).toFixed(1);"
+    "    }"
+    "  }catch(e){}"
+    "}"
+
+    "setInterval(pollGpsRaw,1000); pollGpsRaw();"
+    "setInterval(pollGpsPos,1000); pollGpsPos();"
+    "</script>"
+  );
+
   html+=F("<div class='box'><h2>Info</h2>");
   html+=F("Mode: "); html+=(g_isAPMode?"AP":"STA");
   html+=F("<br>AP SSID: SAT_TRACKER, PASS: sat123456<br>");
@@ -1169,6 +1369,7 @@ void handleRoot(){
 }
 
 void handleConfig(){
+  // uloží se pouze hodnoty z formuláře (může to být GPS-live poloha, pokud byla zobrazená)
   if(server.hasArg("lat")) g_qthLat=server.arg("lat").toFloat();
   if(server.hasArg("lon")) g_qthLon=server.arg("lon").toFloat();
   if(server.hasArg("alt")) g_qthAlt=server.arg("alt").toFloat();
@@ -1187,7 +1388,7 @@ void handleConfig(){
     String tz=server.arg("tz"); tz.trim();
     if(tz.length()>0){
       tz.toCharArray(g_tz,sizeof(g_tz));
-      configTzTime(g_tz,"pool.ntp.org"); // FIX: okamžitě aplikuj TZ do SNTP
+      configTzTime(g_tz,"pool.ntp.org");
     }
   }
 
@@ -1207,7 +1408,6 @@ void handleConfig(){
     g_sats[i].enabled=server.hasArg(argName);
   }
 
-  // ---- enforce max 4 enabled ----
   int en=0;
   for(int i=0;i<SAT_COUNT;i++){
     if(g_sats[i].enabled){
@@ -1220,6 +1420,7 @@ void handleConfig(){
 
   saveConfig();
   updateSatSites();
+  updateLocatorFromQth();
 
   if(g_haveTime){
     predictPasses(time(nullptr));
@@ -1254,14 +1455,15 @@ void setup(){
   splashStatus("Loading configuration...");
   loadConfig();
 
+  updateLocatorFromQth();
+
   if(g_wifiSsid[0]=='\0'){ strncpy(g_wifiSsid,WIFI_SSID,sizeof(g_wifiSsid)); }
   if(g_wifiPass[0]=='\0'){ strncpy(g_wifiPass,WIFI_PASS,sizeof(g_wifiPass)); }
 
   setenv("TZ",g_tz,1); tzset();
 
-  if(g_gpsEnabled){
-    SerialGPS.begin(g_gpsBaud,SERIAL_8N1,g_gpsRxPin,g_gpsTxPin);
-  }
+  // GPS UART start ALWAYS (kvůli raw stringům do webu)
+  SerialGPS.begin(g_gpsBaud,SERIAL_8N1,g_gpsRxPin,g_gpsTxPin);
 
   bool wifiOk=false;
   if(g_gpsOnlyMode){
@@ -1279,8 +1481,10 @@ void setup(){
   if(wifiOk && !g_gpsOnlyMode){
     splashStatus("Syncing time (NTP)...");
     setupTimeNTP();
+    g_ntpPreferred = true;     // čas vždy z NTP, když WiFi OK
   } else {
     g_haveTime=false;
+    g_ntpPreferred = false;
   }
 
   splashStatus("Initializing TLE and satellites...");
@@ -1299,6 +1503,8 @@ void setup(){
   server.on("/config",HTTP_POST,handleConfig);
   server.on("/sat/add",HTTP_POST,handleAddSat);
   server.on("/sat/del",HTTP_POST,handleDelSat);
+  server.on("/gpsraw",HTTP_GET,handleGpsRaw);
+  server.on("/gpspos",HTTP_GET,handleGpsPos);   // NEW
   server.begin();
 
   splashStatus("Done.");
@@ -1320,18 +1526,17 @@ void loop(){
 
   time_t nowUtc=time(nullptr);
 
-  // FIX 1: GPS čas dorazil -> jednorázově spočti přelety
-  if(g_gpsEnabled && g_gpsTimeSet && !g_passesInitByGps){
+  // GPS time -> passes jen když NTP není preferované
+  if(g_gpsEnabled && !g_ntpPreferred && g_gpsTimeSet && !g_passesInitByGps){
     Serial.println("[AUTO] GPS time valid -> predict passes.");
     predictPasses(nowUtc);
     g_passesInitByGps=true;
-    g_passesInitByTime=true;   // čas už validní
+    g_passesInitByTime=true;
     g_lastPassListMinute=-1;
     clearTrail();
     drawStaticFrame();
   }
 
-  // FIX 2: pozdní SNTP po timeoutu v setupu
   if(!g_passesInitByTime && nowUtc>1672531200){
     g_haveTime=true;
     Serial.println("[AUTO] NTP time valid (late) -> predict passes.");
@@ -1367,7 +1572,6 @@ void loop(){
     }
   }
 
-  // AUTO-RECALC: po skončení přele­tu dopočítej další tabulku
   static int prevActive=-1;
   if(prevActive>=0 && active<0 && g_haveTime){
     Serial.println("[AUTO] Pass ended -> recalculating next passes.");
@@ -1391,6 +1595,7 @@ void loop(){
       drawPassList(nowUtc);
       g_lastPassListMinute=tmLocal.tm_min;
     }
+    drawFooter(tmLocal);
   } else {
     if(active>=0){
       if(g_trailPassIdx!=active) computePassTrack(active);
@@ -1405,6 +1610,4 @@ void loop(){
       drawSatState(si,s,tmLocal,rangeRateKmS);
     }
   }
-
-  if(g_displayMode==MODE_LIST) drawFooter(tmLocal);
 }
